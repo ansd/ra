@@ -22,7 +22,7 @@
          handle_receive_snapshot/2,
          handle_await_condition/2,
          handle_aux/4,
-         handle_state_enter/2,
+         handle_state_enter/3,
          tick/1,
          overview/1,
          metrics/1,
@@ -156,6 +156,12 @@
 -type machine_conf() :: {module, module(), InitConfig :: map()} |
                         {simple, simple_apply_fun(term()),
                          InitialState :: term()}.
+
+%%TODO Expose significant and shutdown?
+-type leader_companion_conf() :: #{start := supervisor:mfargs(),
+                                   type => supervisor:worker(),
+                                   modules => [module()]}.
+
 %% The machine configuration.
 %% This is how ra knows which module to use to invoke the ra_machine callbacks
 %% and the config to pass to the {@link ra_machine:init/1} implementation.
@@ -183,7 +189,8 @@
                               max_pipeline_count => non_neg_integer(),
                               ra_event_formatter => {module(), atom(), [term()]},
                               counter => counters:counters_ref(),
-                              system_config => ra_system:config()}.
+                              system_config => ra_system:config(),
+                              leader_companion_config => leader_companion_conf()}.
 
 -type mutable_config() :: #{cluster_name => ra_cluster_name(),
                             metrics_key => term(),
@@ -209,7 +216,8 @@
               command_reply_mode/0,
               ra_event_formatter_fun/0,
               effect/0,
-              effects/0
+              effects/0,
+              leader_companion_conf/0
              ]).
 
 -spec name(ClusterName :: ra_cluster_name(), UniqueSuffix::string()) -> atom().
@@ -292,7 +300,8 @@ init(#{id := Id,
                effective_machine_module = MacMod,
                max_pipeline_count = MaxPipelineCount,
                counter = maps:get(counter, Config, undefined),
-               system_config = SystemConfig},
+               system_config = SystemConfig,
+               leader_companion_config = maps:get(leader_companion_config, Config, undefined)},
 
     #{cfg => Cfg,
       current_term => CurrentTerm,
@@ -1283,11 +1292,11 @@ tick(#{cfg := #cfg{effective_machine_module = MacMod},
     Now = erlang:system_time(millisecond),
     ra_machine:tick(MacMod, Now, MacState).
 
--spec handle_state_enter(ra_state() | eol, ra_server_state()) ->
+-spec handle_state_enter(ra_state() | eol, ra_state(), ra_server_state()) ->
     {ra_server_state() | eol, effects()}.
-handle_state_enter(RaftState, #{cfg := #cfg{effective_machine_module = MacMod},
-                                machine_state := MacState} = State) ->
-    {become(RaftState, State),
+handle_state_enter(RaftState, OldRaftState, #{cfg := #cfg{effective_machine_module = MacMod},
+                                              machine_state := MacState} = State) ->
+    {change_state(RaftState, OldRaftState, State),
      ra_machine:state_enter(MacMod, RaftState, MacState)}.
 
 
@@ -1413,15 +1422,47 @@ machine_query(QueryFun, #{cfg := #cfg{effective_machine_module = MacMod},
 
 % Internal
 
-become(leader, #{cluster := Cluster, log := Log0} = State) ->
+change_state(leader, OldRaftState, #{cluster := Cluster,
+                                     log := Log0,
+                                     cfg := #cfg{leader_companion_config = CompConf,
+                                                 system_config = #{names := Names},
+                                                 uid = UId,
+                                                 id = {ServerName, _}}} = State0) ->
+    case CompConf of
+        undefined ->
+            ok;
+        #{} when OldRaftState =/= leader ->
+            Parent = ra_directory:where_is_parent(Names, UId),
+            ChildId = {companion, ServerName},
+            case supervisor:get_childspec(Parent, ChildId) of
+                {ok, _} ->
+                    %% This Ra server was already leader once before
+                    supervisor:restart_child(Parent, ChildId);
+                {error, not_found} ->
+                    ChildSpec = maps:put(id, ChildId, CompConf),
+                    supervisor:start_child(Parent, ChildSpec)
+            end
+    end,
     Log = ra_log:release_resources(maps:size(Cluster) + 2, random, Log0),
-    State#{log => Log};
-become(follower, #{log := Log0} = State) ->
+    State0#{log => Log};
+change_state(follower, OldRaftState, #{log := Log0} = State) ->
+    maybe_terminate_leader_companion(follower, OldRaftState, State),
     %% followers should only ever need a single segment open at any one
     %% time
     State#{log => ra_log:release_resources(1, random, Log0)};
-become(_RaftState, State) ->
+change_state(RaftState, OldRaftState, State) ->
+    maybe_terminate_leader_companion(RaftState, OldRaftState, State),
     State.
+
+maybe_terminate_leader_companion(RaftState, leader,
+                                 #{cfg := #cfg{leader_companion_config = #{},
+                                               system_config = #{names := Names},
+                                               uid = UId,
+                                               id = {ServerName, _}}}) when RaftState =/= leader ->
+    Parent = ra_directory:where_is_parent(Names, UId),
+    supervisor:terminate_child(Parent, {companion, ServerName});
+maybe_terminate_leader_companion(_, _, _) ->
+    ok.
 
 follower_catchup_cond_fun(OriginalReason) ->
     fun (Entry, State) ->

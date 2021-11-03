@@ -21,5 +21,6 @@
          effective_machine_module :: module(),
          max_pipeline_count = ?DEFAULT_MAX_PIPELINE_COUNT :: non_neg_integer(),
          counter :: undefined | counters:counters_ref(),
-         system_config :: ra_system:config()
+         system_config :: ra_system:config(),
+         leader_companion_config :: undefined | ra_server:leader_companion_conf()
         }).

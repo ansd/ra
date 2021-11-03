@@ -41,6 +41,3 @@ init(#{data_dir := DataDir,
             ?ERR("Failed to create Ra data directory at '~s', file system operation error: ~p", [DataDir, Code]),
             exit({error, "Ra could not create its data directory. See the log for details."})
     end.
-
-
-

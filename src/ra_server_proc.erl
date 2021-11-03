@@ -953,6 +953,7 @@ handle_enter(RaftState, OldRaftState,
                     server_state = ServerState0} = State) ->
     true = ets:insert(ra_state, {Name, RaftState}),
     {ServerState, Effects} = ra_server:handle_state_enter(RaftState,
+                                                          OldRaftState,
                                                           ServerState0),
     case RaftState == leader orelse OldRaftState == leader of
         true ->
